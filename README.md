@@ -1,2 +1,2 @@
-# LABBER_DRIVERS_SQE_VIRTUAL_CombGenerator
+# LABBER_DRIVERS_SQE_VIRTUAL_CombResponse
 Microwave comb generatore response
