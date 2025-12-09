@@ -199,20 +199,26 @@ class Driver(InstrumentDriver.InstrumentWorker):
             f, signal = self._calculate_complex_spectrum()
 
             if len(f) > 1:
-                dt = f[1] - f[0]  # used as x-step
+                dt = f[1] - f[0]   # frequency step (Hz)
             else:
                 dt = 1.0
 
+            f0 = f[0] if len(f) > 0 else 0.0
+
             if name == 'Spectrum':
-                trace = quant.getTraceDict(signal, t0=0.0, dt=dt)
+                # Complex I/Q, x-axis = frequency
+                trace = quant.getTraceDict(signal, t0=f0, dt=dt)
                 return trace
 
             if name == 'Spectrum (dBm)':
+                # Power in dBm, x-axis = frequency
                 power_linear = np.abs(signal) ** 2
                 power_linear[power_linear <= 1e-24] = 1e-24
                 power_dBm = 10.0 * np.log10(power_linear)
-                trace = quant.getTraceDict(power_dBm, t0=0.0, dt=dt)
-                return trace
+                trace = quant.getTraceDict(power_dBm, t0=f0, dt=dt)
+            
+            return trace
+
 
         # -------- Time-domain output --------
         if name == 'Time trace':
