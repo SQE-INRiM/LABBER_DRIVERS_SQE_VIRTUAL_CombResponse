@@ -3,234 +3,181 @@ import numpy as np
 
 
 class Driver(InstrumentDriver.InstrumentWorker):
-    """Virtual pump-referenced comb-response generator for Labber.
+    """Virtual SQUID-like comb generator using time-domain pulses.
 
-    - Lines at f_n = n * f_p, n = Min order ... Max order
-    - Amplitude decreases with harmonic order (envelope in n)
-    - 'Spectrum'        -> complex VECTOR_COMPLEX (PNA-X-like I/Q)
-    - 'Spectrum (dBm)'  -> real VECTOR in dBm (SA-like power spectrum)
-    - 'Time trace'      -> real VECTOR in V (QCS-like voltage vs time)
+    Steps:
+      1. Build a periodic voltage pulse train in time (alternating sign).
+      2. FFT -> complex comb in frequency domain.
+      3. Interpolate FFT onto the Labber frequency grid.
+      4. Apply noise / gain / offset / global phase.
+      5. Return 'Spectrum' as VECTOR_COMPLEX vs frequency.
     """
 
     # ----------------------- Standard hooks -----------------------
 
     def performOpen(self, options={}):
-        # No real hardware to open
+        # Purely virtual instrument
         pass
 
     def performClose(self, bError=False, options={}):
-        # No real hardware to close
         pass
 
     def performSetValue(self, quant, value, sweepRate=0.0, options={}):
-        # Just store the value, Labber handles the bookkeeping
+        # Just store the value
         return value
 
-    # ----------------- Common harmonic configuration -----------------
+    # ----------------- Time-domain pulse construction -----------------
 
-    def _get_orders_and_amps(self):
-        """Return harmonic orders, line frequencies, and envelope amplitudes (normalized).
+    def _build_time_pulse_train(self):
+        """Construct a periodic voltage pulse train v(t).
 
         Returns
         -------
-        orders : np.ndarray of int
-            Harmonic indices n (n_min ... n_max)
-        line_freqs : np.ndarray of float
-            Harmonic frequencies f_n = n * f_p
-        amps : np.ndarray of float
-            Real positive amplitudes for each harmonic (max normalized to 1)
+        t : np.ndarray
+            Time axis [s].
+        v : np.ndarray
+            Voltage vs time [V].
         """
-        # Pump and harmonic range
-        fp = self.getValue('Pump frequency')
-        n_min = int(self.getValue('Min order'))
-        n_max = int(self.getValue('Max order'))
+        # Pulse / pump parameters
+        fp = self.getValue('Pump frequency')          # pump / repetition frequency [Hz]
+        A = self.getValue('Pulse amplitude')          # [V]
+        frac_width = self.getValue('Pulse width (fraction of period)')
+        n_periods = int(self.getValue('Number of periods'))
+        samples_per_period = int(self.getValue('Samples per period'))
+        remove_dc = bool(self.getValue('DC removal'))
+        alt_sign = bool(self.getValue('Alternating sign'))
 
-        if n_min < 1:
-            n_min = 1
-        if n_max < n_min:
-            n_max = n_min
+        # Safety / sanity
+        if fp <= 0.0:
+            fp = 1e9
+        if samples_per_period < 8:
+            samples_per_period = 8
+        if n_periods < 1:
+            n_periods = 1
+        # Limit width fraction to sensible range
+        frac_width = max(1e-3, min(frac_width, 0.9))
 
-        orders = np.arange(n_min, n_max + 1, dtype=int)
-        line_freqs = orders * fp
+        T = 1.0 / fp
+        fs = fp * samples_per_period   # sampling rate [Hz]
+        dt = 1.0 / fs
+        n_t = n_periods * samples_per_period
 
-        # Envelope
-        env_type = self.getValue('Amplitude envelope')
+        # Time axis
+        t = np.arange(n_t) * dt
 
-        if env_type == 'Power law':
-            alpha = self.getValue('Power-law exponent')
-            alpha = max(alpha, 0.0)
-            amps = 1.0 / (orders.astype(float) ** alpha)
+        # Gaussian pulse parameters
+        # Interpret "Pulse width (fraction of period)" as FWHM = frac_width * T
+        fwhm = frac_width * T
+        sigma = fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))  # FWHM -> sigma
 
-        elif env_type == 'Gaussian in n':
-            sigma_n = self.getValue('Gaussian width in n')
-            if sigma_n <= 0:
-                sigma_n = 1.0
-            amps = np.exp(-0.5 * ((orders - 1.0) / sigma_n) ** 2)
+        # Build pulse train
+        v = np.zeros_like(t, dtype=float)
+        for k in range(n_periods):
+            # Place one pulse per period, centered at middle of the period
+            t0 = (k + 0.5) * T
+            sign = (-1)**k if alt_sign else 1.0
+            v += sign * A * np.exp(-0.5 * ((t - t0) / sigma) ** 2)
 
-        else:  # 'Custom'
-            s = self.getValue('Custom amplitudes')
-            try:
-                vals = np.array(
-                    [float(x) for x in s.split(',') if x.strip() != '']
-                )
-                N = len(orders)
-                if len(vals) < N:
-                    vals = np.pad(vals, (0, N - len(vals)), mode='edge')
-                elif len(vals) > N:
-                    vals = vals[:N]
-                amps = vals
-            except Exception:
-                amps = np.ones_like(orders, dtype=float)
+        # Remove DC offset if requested
+        if remove_dc:
+            v = v - np.mean(v)
 
-        # Normalize so maximum amplitude is 1
-        max_amp = np.max(np.abs(amps))
-        if max_amp > 0:
-            amps = amps / max_amp
-        else:
-            amps = np.ones_like(orders, dtype=float)
+        return t, v, fs
 
-        return orders, line_freqs, amps
-
-    # ----------------- Frequency-domain calculation -----------------
+    # ----------------- Frequency-domain spectrum from FFT -----------------
 
     def _calculate_complex_spectrum(self):
-        """Build frequency axis and complex comb response (continuous vs f)."""
-        # 1) Frequency axis
+        """Compute the comb spectrum from the time-domain pulse train.
+
+        Returns
+        -------
+        f_spec : np.ndarray
+            Frequency axis for requested spectrum (Labber sweep) [Hz].
+        signal_spec : np.ndarray
+            Complex spectrum at those frequencies.
+        """
+        # 1) Build time-domain pulse train
+        t, v, fs = self._build_time_pulse_train()
+        n_t = len(t)
+
+        # 2) FFT (one-sided real FFT)
+        # Use rfft since v is real; frequency axis from 0 to fs/2
+        V_f = np.fft.rfft(v)
+        freqs_fft = np.fft.rfftfreq(n_t, d=1.0/fs)
+
+        # Normalize (optional); here we normalize by number of points
+        V_f = V_f / n_t
+
+        # 3) Desired Labber spectrum axis (PNA-X-like sweep)
         f0 = self.getValue('Start frequency')
         f1 = self.getValue('Stop frequency')
         n_points = int(self.getValue('Number of points'))
-        f = np.linspace(f0, f1, n_points)
 
-        # 2) Harmonics and envelope
-        orders, line_freqs, amps = self._get_orders_and_amps()
-        gamma = self.getValue('Linewidth')  # FWHM-like
-        gamma_rad = gamma / 2.0
+        if n_points < 2:
+            n_points = 2
+        f_spec = np.linspace(f0, f1, n_points)
 
-        global_phase = self.getValue('Global phase')
+        # 4) Interpolate complex spectrum onto f_spec
+        # Outside [0, fs/2] we set spectrum to zero.
+        # Interpolate real and imag separately.
+        real_interp = np.interp(
+            f_spec,
+            freqs_fft,
+            V_f.real,
+            left=0.0,
+            right=0.0
+        )
+        imag_interp = np.interp(
+            f_spec,
+            freqs_fft,
+            V_f.imag,
+            left=0.0,
+            right=0.0
+        )
+        signal_spec = real_interp + 1j * imag_interp
 
-        # 3) Sum Lorentzian-like complex lines
-        signal = np.zeros_like(f, dtype=complex)
-        for a, fn in zip(amps, line_freqs):
-            if gamma_rad > 0:
-                signal += a / (1.0 + 1j * (f - fn) / gamma_rad)
-            else:
-                # If gamma=0, fall back to very narrow Gaussian spike
-                signal += a * np.exp(-((f - fn) ** 2) / (2 * (1.0e3 ** 2)))
-
+        # 5) Apply global phase, noise, gain, offset in frequency domain
         # Global phase
-        signal *= np.exp(1j * global_phase)
-
-        # 4) Add noise (magnitude & phase per frequency point)
-        if self.getValue('Add noise'):
-            mag_noise = max(self.getValue('Magnitude noise'), 0.0)
-            phase_noise = max(self.getValue('Phase noise'), 0.0)
-
-            mag_factor = 1.0 + np.sqrt(
-                np.random.uniform(0.0, mag_noise, len(signal))
-            )
-            phase_rand = np.random.uniform(
-                0.0, phase_noise * np.pi, len(signal)
-            )
-            signal = signal * mag_factor * np.exp(1j * phase_rand)
-
-        # 5) Gain & offset (complex)
-        gain = self.getValue('Gain')
-        offset = self.getValue('Offset')
-        signal = gain * signal + offset
-
-        return f, signal
-
-    # ----------------- Time-domain calculation -----------------
-
-    def _calculate_time_trace(self):
-        """Build time vector and real voltage trace from discrete harmonics.
-
-        This corresponds to a periodic train of pulses with period 1/f_p,
-        like the upper panel of Fig. 1c (QCS-style time-domain signal).
-        """
-        # Time axis
-        fs = self.getValue('Sample rate')          # Hz
-        n_t = int(self.getValue('Number of time points'))
-        if fs <= 0:
-            fs = 1e9  # fallback
-        t = np.arange(n_t) / fs
-
-        # Harmonics and envelope
-        orders, line_freqs, amps = self._get_orders_and_amps()
         global_phase = self.getValue('Global phase')
+        signal_spec *= np.exp(1j * global_phase)
 
-        # Complex harmonic coefficients
-        coeffs = amps.astype(complex) * np.exp(1j * global_phase)
-
-        # Optional static noise per harmonic (amplitude & phase)
+        # Noise
         if self.getValue('Add noise'):
             mag_noise = max(self.getValue('Magnitude noise'), 0.0)
             phase_noise = max(self.getValue('Phase noise'), 0.0)
             mag_factor = 1.0 + np.sqrt(
-                np.random.uniform(0.0, mag_noise, len(coeffs))
+                np.random.uniform(0.0, mag_noise, len(signal_spec))
             )
             phase_rand = np.random.uniform(
-                0.0, phase_noise * np.pi, len(coeffs)
+                0.0, phase_noise * np.pi, len(signal_spec)
             )
-            coeffs = coeffs * mag_factor * np.exp(1j * phase_rand)
+            signal_spec = signal_spec * mag_factor * np.exp(1j * phase_rand)
 
-        # Build time signal: sum_n Re[ a_n e^{i 2π n f_p t} ]
-        v_complex = np.zeros_like(t, dtype=complex)
-        for a_n, f_n in zip(coeffs, line_freqs):
-            v_complex += a_n * np.exp(1j * 2.0 * np.pi * f_n * t)
-
-        v = np.real(v_complex)
-
-        # Gain & offset in time-domain (voltage)
+        # Gain & offset
         gain = self.getValue('Gain')
         offset = self.getValue('Offset')
-        v = gain * v + offset
+        signal_spec = gain * signal_spec + offset
 
-        return t, v
+        return f_spec, signal_spec
 
-    # ------------------------ GetValue logic ------------------------
+    # ----------------- GetValue -----------------
 
     def performGetValue(self, quant, options={}):
-        """Handle Labber getValue requests."""
         name = quant.name
 
-        # -------- Frequency-domain outputs --------
-        if name in ('Spectrum', 'Spectrum (dBm)'):
-            f, signal = self._calculate_complex_spectrum()
+        if name == 'Spectrum':
+            # Compute spectrum from time-domain pulse train
+            f_spec, signal_spec = self._calculate_complex_spectrum()
 
-            if len(f) > 1:
-                dt = f[1] - f[0]   # frequency step (Hz)
+            # Encode frequency axis as t0 + n*dt for Labber
+            if len(f_spec) > 1:
+                df = f_spec[1] - f_spec[0]
             else:
-                dt = 1.0
+                df = 1.0
+            f0 = f_spec[0] if len(f_spec) > 0 else 0.0
 
-            f0 = f[0] if len(f) > 0 else 0.0
+            trace = quant.getTraceDict(signal_spec, t0=f0, dt=df)
+            return trace        
 
-            if name == 'Spectrum':
-                # Complex I/Q, x-axis = frequency
-                trace = quant.getTraceDict(signal, t0=f0, dt=dt)
-                return trace
-
-            if name == 'Spectrum (dBm)':
-                # Power in dBm, x-axis = frequency
-                power_linear = np.abs(signal) ** 2
-                power_linear[power_linear <= 1e-24] = 1e-24
-                power_dBm = 10.0 * np.log10(power_linear)
-                trace = quant.getTraceDict(power_dBm, t0=f0, dt=dt)
-            
-            return trace
-
-
-        # -------- Time-domain output --------
-        if name == 'Time trace':
-            t, v = self._calculate_time_trace()
-
-            if len(t) > 1:
-                dt = t[1] - t[0]
-            else:
-                dt = 1.0
-
-            trace = quant.getTraceDict(v, t0=0.0, dt=dt)
-            return trace
-
-        # Other scalar quantities: just return stored value
+        # All other quantities: just return stored value
         return quant.getValue()
