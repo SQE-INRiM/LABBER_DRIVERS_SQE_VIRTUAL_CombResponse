@@ -3,14 +3,16 @@ import numpy as np
 
 
 class Driver(InstrumentDriver.InstrumentWorker):
-    """Virtual SQUID-like comb generator using time-domain pulses.
+    """Virtual SQUID comb response in the frequency domain.
 
-    Steps:
-      1. Build a periodic voltage pulse train in time (alternating sign).
-      2. FFT -> complex comb in frequency domain.
-      3. Interpolate FFT onto the Labber frequency grid.
-      4. Apply noise / gain / offset / global phase.
-      5. Return 'Spectrum' as VECTOR_COMPLEX vs frequency.
+    Physics:
+      - Flux drive: Phi(t)/Phi0 = Phi_DC + Phi_RF * cos(2π f_p t)
+      - Phase:      phi(t) = pi * Phi(t)/Phi0
+      - Voltage:    V(t) = -(r/2) * [(1 + tan^2 phi)/(1 + r^2 tan^2 phi)] * d(Phi)/dt
+      - Here Phi is expressed in units of Phi0, so dPhi/dt = Phi0 * d(Phi_norm)/dt.
+      - We build V(t), FFT it, and interpolate onto the requested
+        [Start frequency, Stop frequency] axis.
+      - Output: complex 'Spectrum' (VECTOR_COMPLEX), like a PNA-X trace.
     """
 
     # ----------------------- Standard hooks -----------------------
@@ -20,16 +22,17 @@ class Driver(InstrumentDriver.InstrumentWorker):
         pass
 
     def performClose(self, bError=False, options={}):
+        # Purely virtual instrument
         pass
 
     def performSetValue(self, quant, value, sweepRate=0.0, options={}):
         # Just store the value
         return value
 
-    # ----------------- Time-domain pulse construction -----------------
+    # ----------------- Time-domain SQUID waveform -----------------
 
-    def _build_time_pulse_train(self):
-        """Construct a periodic voltage pulse train v(t).
+    def _build_squid_time_trace(self):
+        """Construct time axis and SQUID voltage V(t) using the flux model.
 
         Returns
         -------
@@ -37,89 +40,92 @@ class Driver(InstrumentDriver.InstrumentWorker):
             Time axis [s].
         v : np.ndarray
             Voltage vs time [V].
+        fs : float
+            Sampling rate [Hz].
         """
-        # Pulse / pump parameters
-        fp = self.getValue('Pump frequency')          # pump / repetition frequency [Hz]
-        A = self.getValue('Pulse amplitude')          # [V]
-        frac_width = self.getValue('Pulse width (fraction of period)')
+        # Read parameters
+        fp = self.getValue('Pump frequency')            # [Hz]
+        phi_dc = self.getValue('DC flux bias')          # Phi_DC / Phi0
+        phi_rf = self.getValue('RF flux amplitude')     # Phi_RF / Phi0
+        r = self.getValue('Asymmetry r')                # asymmetry
+        A_scale = self.getValue('Pulse amplitude scale')      # dimensionless gain
+
         n_periods = int(self.getValue('Number of periods'))
         samples_per_period = int(self.getValue('Samples per period'))
         remove_dc = bool(self.getValue('DC removal'))
-        alt_sign = bool(self.getValue('Alternating sign'))
 
-        # Safety / sanity
+        # Sanity checks
         if fp <= 0.0:
             fp = 1e9
-        if samples_per_period < 8:
-            samples_per_period = 8
         if n_periods < 1:
             n_periods = 1
-        # Limit width fraction to sensible range
-        frac_width = max(1e-3, min(frac_width, 0.9))
+        if samples_per_period < 8:
+            samples_per_period = 8
 
+        # Time grid
         T = 1.0 / fp
-        fs = fp * samples_per_period   # sampling rate [Hz]
+        fs = fp * samples_per_period
         dt = 1.0 / fs
         n_t = n_periods * samples_per_period
+        t = np.arange(n_t, dtype=float) * dt
 
-        # Time axis
-        t = np.arange(n_t) * dt
+        # Normalized flux: Phi_norm(t) = Phi(t)/Phi0
+        phi_norm = phi_dc + phi_rf * np.cos(2.0 * np.pi * fp * t)
+        # Phase phi(t) = pi * Phi_norm(t)
+        phi = np.pi * phi_norm
 
-        # Gaussian pulse parameters
-        # Interpret "Pulse width (fraction of period)" as FWHM = frac_width * T
-        fwhm = frac_width * T
-        sigma = fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))  # FWHM -> sigma
+        # Avoid divergence near tan(pi/2)
+        tan_phi = np.tan(phi)
+        tan_phi = np.clip(tan_phi, -1e4, 1e4)
 
-        # Build pulse train
-        v = np.zeros_like(t, dtype=float)
-        for k in range(n_periods):
-            # Place one pulse per period, centered at middle of the period
-            t0 = (k + 0.5) * T
-            sign = (-1)**k if alt_sign else 1.0
-            v += sign * A * np.exp(-0.5 * ((t - t0) / sigma) ** 2)
+        # Nonlinear prefactor
+        numerator = 1.0 + tan_phi**2
+        denominator = 1.0 + (r**2) * tan_phi**2
+        nonlinear_factor = numerator / denominator
 
-        # Remove DC offset if requested
+        # d(Phi_norm)/dt  [1/s]
+        dphi_norm_dt = -2.0 * np.pi * fp * phi_rf * np.sin(2.0 * np.pi * fp * t)
+
+        # Flux quantum [Wb]
+        PHI0 = 2.067833848e-15
+
+        # Voltage from theory (in volts, up to overall scale A_scale)
+        # V(t) = -(r/2) * factor * PHI0 * d(Phi_norm)/dt
+        v_th = -0.5 * r * nonlinear_factor * dphi_norm_dt * PHI0
+
+        # Apply scaling
+        v = A_scale * v_th
+
+        # Remove DC component if requested
         if remove_dc:
             v = v - np.mean(v)
 
         return t, v, fs
 
-    # ----------------- Frequency-domain spectrum from FFT -----------------
+    # ----------------- Frequency-domain spectrum -----------------
 
     def _calculate_complex_spectrum(self):
-        """Compute the comb spectrum from the time-domain pulse train.
-
-        Returns
-        -------
-        f_spec : np.ndarray
-            Frequency axis for requested spectrum (Labber sweep) [Hz].
-        signal_spec : np.ndarray
-            Complex spectrum at those frequencies.
-        """
-        # 1) Build time-domain pulse train
-        t, v, fs = self._build_time_pulse_train()
+        """Compute complex comb spectrum from SQUID time-domain response."""
+        # 1) Time-domain SQUID signal
+        t, v, fs = self._build_squid_time_trace()
         n_t = len(t)
 
-        # 2) FFT (one-sided real FFT)
-        # Use rfft since v is real; frequency axis from 0 to fs/2
+        # 2) FFT (one-sided)
         V_f = np.fft.rfft(v)
-        freqs_fft = np.fft.rfftfreq(n_t, d=1.0/fs)
+        freqs_fft = np.fft.rfftfreq(n_t, d=1.0 / fs)
 
-        # Normalize (optional); here we normalize by number of points
+        # Normalize so amplitude doesn't scale with record length
         V_f = V_f / n_t
 
-        # 3) Desired Labber spectrum axis (PNA-X-like sweep)
+        # 3) Requested spectrum axis
         f0 = self.getValue('Start frequency')
         f1 = self.getValue('Stop frequency')
         n_points = int(self.getValue('Number of points'))
-
         if n_points < 2:
             n_points = 2
         f_spec = np.linspace(f0, f1, n_points)
 
-        # 4) Interpolate complex spectrum onto f_spec
-        # Outside [0, fs/2] we set spectrum to zero.
-        # Interpolate real and imag separately.
+        # 4) Interpolate complex FFT onto f_spec
         real_interp = np.interp(
             f_spec,
             freqs_fft,
@@ -136,15 +142,14 @@ class Driver(InstrumentDriver.InstrumentWorker):
         )
         signal_spec = real_interp + 1j * imag_interp
 
-        # 5) Apply global phase, noise, gain, offset in frequency domain
-        # Global phase
+        # 5) Apply global phase, noise, gain, offset
         global_phase = self.getValue('Global phase')
         signal_spec *= np.exp(1j * global_phase)
 
-        # Noise
         if self.getValue('Add noise'):
             mag_noise = max(self.getValue('Magnitude noise'), 0.0)
             phase_noise = max(self.getValue('Phase noise'), 0.0)
+
             mag_factor = 1.0 + np.sqrt(
                 np.random.uniform(0.0, mag_noise, len(signal_spec))
             )
@@ -153,7 +158,6 @@ class Driver(InstrumentDriver.InstrumentWorker):
             )
             signal_spec = signal_spec * mag_factor * np.exp(1j * phase_rand)
 
-        # Gain & offset
         gain = self.getValue('Gain')
         offset = self.getValue('Offset')
         signal_spec = gain * signal_spec + offset
@@ -166,18 +170,17 @@ class Driver(InstrumentDriver.InstrumentWorker):
         name = quant.name
 
         if name == 'Spectrum':
-            # Compute spectrum from time-domain pulse train
             f_spec, signal_spec = self._calculate_complex_spectrum()
 
-            # Encode frequency axis as t0 + n*dt for Labber
+            # Encode frequency axis as t0 + n*dt (Labber will label it Frequency [Hz])
             if len(f_spec) > 1:
-                df = f_spec[1] - f_spec[0]
+                dt = f_spec[1] - f_spec[0]
             else:
-                df = 1.0
+                dt = 1.0
             f0 = f_spec[0] if len(f_spec) > 0 else 0.0
 
-            trace = quant.getTraceDict(signal_spec, t0=f0, dt=df)
-            return trace        
+            trace = quant.getTraceDict(signal_spec, t0=f0, dt=dt)
+            return trace
 
-        # All other quantities: just return stored value
+        # All other scalar quantities
         return quant.getValue()
